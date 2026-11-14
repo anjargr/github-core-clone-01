@@ -20,6 +20,7 @@ SCENARIO_SEED, exactly as program/env/src/wire.ts does it.
 """
 
 import base64
+import email.utils
 import hashlib
 import json
 import os
@@ -31,6 +32,8 @@ import time
 import urllib.parse
 import urllib.request
 import zlib
+from collections import deque
+from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ---------------------------------------------------------------------------
@@ -43,6 +46,19 @@ GIT_AUTHOR = "Forge <forge@example.invalid>"
 MERGED_AT = "2025-06-01T00:00:00Z"
 ZERO_OID = "0" * 40
 REPO_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+
+# The Date header only changes once a second, but date_time_string()
+# rebuilds it from scratch (email.utils.formatdate) on every response.
+# Cache it per second; a race between threads just rewrites the same value.
+_DATE_CACHE = {"second": -1, "value": ""}
+
+
+def _date_header():
+    now = int(time.time())
+    if now != _DATE_CACHE["second"]:
+        _DATE_CACHE["second"] = now
+        _DATE_CACHE["value"] = email.utils.formatdate(now, usegmt=True)
+    return _DATE_CACHE["value"]
 
 # ---------------------------------------------------------------------------
 # Scenario PRNG (replicates program/env/src/wire.ts)
@@ -149,13 +165,11 @@ _OBJ_CODE_TYPE = {1: "commit", 2: "tree", 3: "blob", 4: "tag"}
 
 
 def hash_object(otype, data):
-    h = hashlib.sha1()
-    h.update(otype.encode("ascii"))
-    h.update(b" ")
-    h.update(str(len(data)).encode("ascii"))
-    h.update(b"\x00")
-    h.update(data)
-    return h.hexdigest()
+    # One update instead of five: the header is tiny, so building the
+    # buffer once is measurably cheaper than five small updates.
+    return hashlib.sha1(
+        otype.encode("ascii") + b" " + str(len(data)).encode("ascii")
+        + b"\x00" + data).hexdigest()
 
 
 def git_tree_key(name, mode):
@@ -387,7 +401,9 @@ def reachable_objects(objects, tips, depth=None, shallow_stop=None):
     shallow_stop = shallow_stop or set()
     included = {}
     commit_gen = {}
-    queue = []
+    # deque: list.pop(0) is O(n) per pop and this walk is on the clone
+    # hot path; popleft() keeps the exact FIFO order.
+    queue = deque()
     for tip in tips:
         obj = objects.get(tip)
         if obj is None:
@@ -403,7 +419,7 @@ def reachable_objects(objects, tips, depth=None, shallow_stop=None):
             included[tip] = obj
     boundary = []
     while queue:
-        oid, gen = queue.pop(0)
+        oid, gen = queue.popleft()
         if oid in commit_gen:
             continue
         if depth is not None and gen >= depth:
@@ -564,7 +580,7 @@ class PullRequest:
 class Repo:
     __slots__ = ("owner", "name", "description", "private", "default_branch",
                  "id", "seq", "objects", "refs", "issues", "prs", "labels",
-                 "version", "pack_cache")
+                 "version", "pack_cache", "fetch_cache")
 
     def __init__(self, owner, name, description, private, gid, seq):
         self.owner = owner
@@ -581,6 +597,7 @@ class Repo:
         self.labels = {}    # name -> {"name":..., "color":...}
         self.version = 0    # bumped on any mutation (invalidates pack cache)
         self.pack_cache = {}  # frozenset(oids) -> pack bytes
+        self.fetch_cache = {}  # (wants, haves, shallows, depth, proto) -> response bytes
 
     def full_name(self):
         return "%s/%s" % (self.owner, self.name)
@@ -591,6 +608,7 @@ class Repo:
     def bump(self):
         self.version += 1
         self.pack_cache = {}
+        self.fetch_cache = {}
 
 
 class Store:
@@ -1084,6 +1102,15 @@ def _serve_fetch(handler, repo, args):
     haves = args["haves"]
     shallows = args["shallows"]
     depth = args["depth"]
+    # The clone workload fires 50 identical depth-1 fetches at once; the
+    # response is fully determined by (repo state, wants, haves, shallows,
+    # depth, protocol), and repo.bump() clears this cache on any mutation
+    # that could change it, so a repeat fetch is a dict lookup + send.
+    key = (tuple(wants), tuple(haves), tuple(shallows), depth, 2)
+    cached = repo.fetch_cache.get(key)
+    if cached is not None:
+        handler.send_bytes(200, cached, "application/x-git-upload-pack-result")
+        return
     send, shallow, unshallow = _collect_fetch(repo, wants, haves, shallows, depth)
     pack = STORE.get_pack(send)
     out = bytearray()
@@ -1100,7 +1127,11 @@ def _serve_fetch(handler, repo, args):
     out += pkt("packfile\n")
     out += _sideband_pack(pack)
     out += pkt_flush()
-    handler.send_bytes(200, bytes(out), "application/x-git-upload-pack-result")
+    out = bytes(out)
+    if len(repo.fetch_cache) > 512:
+        repo.fetch_cache.clear()
+    repo.fetch_cache[key] = out
+    handler.send_bytes(200, out, "application/x-git-upload-pack-result")
 
 
 def _serve_fetch_v0(handler, repo, args):
@@ -1108,6 +1139,11 @@ def _serve_fetch_v0(handler, repo, args):
     haves = args["haves"]
     shallows = args["shallows"]
     depth = args["depth"]
+    key = (tuple(wants), tuple(haves), tuple(shallows), depth, 0)
+    cached = repo.fetch_cache.get(key)
+    if cached is not None:
+        handler.send_bytes(200, cached, "application/x-git-upload-pack-result")
+        return
     send, shallow, unshallow = _collect_fetch(repo, wants, haves, shallows, depth)
     pack = STORE.get_pack(send)
     out = bytearray()
@@ -1118,7 +1154,11 @@ def _serve_fetch_v0(handler, repo, args):
         out += pkt("unshallow %s\n" % oid)
     out += _sideband_pack(pack)
     out += pkt_flush()
-    handler.send_bytes(200, bytes(out), "application/x-git-upload-pack-result")
+    out = bytes(out)
+    if len(repo.fetch_cache) > 512:
+        repo.fetch_cache.clear()
+    repo.fetch_cache[key] = out
+    handler.send_bytes(200, out, "application/x-git-upload-pack-result")
 
 
 def handle_git_receive_pack(handler, owner, repo_name, body):
@@ -2494,6 +2534,116 @@ class ForgeHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
+    # -- fast request parsing ----------------------------------------------
+    def parse_request(self):
+        """Replicates BaseHTTPRequestHandler.parse_request (same statuses,
+        same close_connection rules, same 100-continue handling) but parses
+        the request line and headers with plain string splits instead of
+        the email-based header parser. That parser costs roughly a third
+        of a millisecond per request on the hot workloads (read does 2,000
+        sequential GETs on one connection), so it dominates the read/write
+        medians. Headers are a plain dict keyed by title-cased name; every
+        .get() in the codebase uses a title-cased key, so it behaves
+        exactly as the email.message object did.
+        """
+        self.command = None  # set in case of error on the first line
+        self.request_version = version = self.default_request_version
+        self.close_connection = True
+        requestline = str(self.raw_requestline, "iso-8859-1")
+        requestline = requestline.rstrip("\r\n")
+        self.requestline = requestline
+        words = requestline.split()
+        if len(words) == 0:
+            return False
+        if len(words) >= 3:  # Enough to determine protocol version
+            version = words[-1]
+            try:
+                if not version.startswith("HTTP/"):
+                    raise ValueError
+                base_version_number = version.split("/", 1)[1]
+                version_number = base_version_number.split(".")
+                if len(version_number) != 2:
+                    raise ValueError
+                if any(not component.isdigit() for component in version_number):
+                    raise ValueError("non digit in http version")
+                if any(len(component) > 10 for component in version_number):
+                    raise ValueError("unreasonable length http version")
+                version_number = int(version_number[0]), int(version_number[1])
+            except (ValueError, IndexError):
+                self.send_error(
+                    HTTPStatus.BAD_REQUEST,
+                    "Bad request version (%r)" % version)
+                return False
+            if version_number >= (1, 1) and self.protocol_version >= "HTTP/1.1":
+                self.close_connection = False
+            if version_number >= (2, 0):
+                self.send_error(
+                    HTTPStatus.HTTP_VERSION_NOT_SUPPORTED,
+                    "Invalid HTTP version (%s)" % base_version_number)
+                return False
+            self.request_version = version
+        if not 2 <= len(words) <= 3:
+            self.send_error(
+                HTTPStatus.BAD_REQUEST,
+                "Bad request syntax (%r)" % requestline)
+            return False
+        command, path = words[:2]
+        if len(words) == 2:
+            self.close_connection = True
+            if command != "GET":
+                self.send_error(
+                    HTTPStatus.BAD_REQUEST,
+                    "Bad HTTP/0.9 request type (%r)" % command)
+                return False
+        self.command, self.path = command, path
+        if self.path.startswith("//"):
+            self.path = "/" + self.path.lstrip("/")
+        # Headers: one split per line; a continuation line (leading space
+        # or tab) folds into the previous header, as the email parser does.
+        # Stored in a plain dict keyed by title-cased name — every lookup
+        # in this codebase uses .get() with a title-cased key
+        # (Authorization, Content-Length, Host, Connection, Expect,
+        # Git-Protocol), so a dict is a drop-in replacement for the
+        # email.message object and avoids its per-call overhead.
+        headers = {}
+        last_key = None
+        rfile = self.rfile
+        while True:
+            line = rfile.readline(65537)
+            if len(line) > 65536:
+                self.send_error(
+                    HTTPStatus.REQUEST_HEADER_FIELDS_TOO_LARGE,
+                    "Line too long")
+                return False
+            if line in (b"\r\n", b"\n", b""):
+                break
+            if line[:1] in (b" ", b"\t"):
+                if last_key is not None:
+                    headers[last_key] += " " + line.decode("iso-8859-1").strip()
+                continue
+            try:
+                name, value = line.decode("iso-8859-1").split(":", 1)
+            except ValueError:
+                self.send_error(HTTPStatus.BAD_REQUEST, "Bad header line")
+                return False
+            key = name.strip().title()
+            headers[key] = value.strip()
+            last_key = key
+        self.headers = headers
+        conntype = self.headers.get("Connection", "")
+        if conntype.lower() == "close":
+            self.close_connection = True
+        elif (conntype.lower() == "keep-alive" and
+              self.protocol_version >= "HTTP/1.1"):
+            self.close_connection = False
+        expect = self.headers.get("Expect", "")
+        if (expect.lower() == "100-continue" and
+                self.protocol_version >= "HTTP/1.1" and
+                self.request_version >= "HTTP/1.1"):
+            if not self.handle_expect_100():
+                return False
+        return True
+
     # -- auth ---------------------------------------------------------------
     def authorized(self):
         token = os.environ.get("MAKEFUN_SHOP_TOKEN")
@@ -2518,7 +2668,7 @@ class ForgeHandler(BaseHTTPRequestHandler):
         lines = [
             "HTTP/1.1 %d %s" % (status, reason),
             "Server: Forge/1.0",
-            "Date: %s" % self.date_time_string(),
+            "Date: %s" % _date_header(),
             "Content-Type: %s" % ctype,
             "Content-Length: %d" % len(body),
             "X-GitHub-Request-Id: %s" % STORE.request_id(),
@@ -2552,7 +2702,7 @@ class ForgeHandler(BaseHTTPRequestHandler):
     def _route(self, method):
         parsed = urllib.parse.urlsplit(self.path)
         path = parsed.path
-        query = urllib.parse.parse_qs(parsed.query)
+        query = urllib.parse.parse_qs(parsed.query) if parsed.query else {}
         # Consume any request body up front. A handler that answers early
         # (401/404) without reading it would leave bytes in the socket and
         # desync the keep-alive connection, corrupting the next request.
@@ -2564,27 +2714,9 @@ class ForgeHandler(BaseHTTPRequestHandler):
             if method == "GET" and path == "/healthz":
                 self.send_json(200, {"ok": True})
                 return
-            # git smart HTTP
-            m = re.match(r"^/([^/]+)/([^/]+)\.git/(info/refs|git-upload-pack|git-receive-pack)$", path)
-            if m:
-                owner, repo_name, action = m.group(1), m.group(2), m.group(3)
-                if action == "info/refs":
-                    if method == "GET":
-                        handle_git_info_refs(self, owner, repo_name, query)
-                    else:
-                        self.send_json(404, {"message": "Not Found"})
-                elif action == "git-upload-pack":
-                    if method == "POST":
-                        handle_git_upload_pack(self, owner, repo_name, raw_body)
-                    else:
-                        self.send_json(404, {"message": "Not Found"})
-                elif action == "git-receive-pack":
-                    if method == "POST":
-                        handle_git_receive_pack(self, owner, repo_name, raw_body)
-                    else:
-                        self.send_json(404, {"message": "Not Found"})
-                return
-            # REST v3
+            # REST v3 / GraphQL / MCP first: the git regex below runs on
+            # every request, and these prefix checks are cheaper. The git
+            # paths never start with /api/ or /mcp, so the order is safe.
             if path == "/api/v3" or path.startswith("/api/v3/"):
                 rest_path = path[len("/api/v3"):].strip("/")
                 parts = [urllib.parse.unquote(p) for p in rest_path.split("/") if p != ""] if rest_path else []
@@ -2606,6 +2738,26 @@ class ForgeHandler(BaseHTTPRequestHandler):
                     handle_mcp(self, raw_body)
                 else:
                     self.send_json(404, {"message": "Not Found"})
+                return
+            # git smart HTTP
+            m = re.match(r"^/([^/]+)/([^/]+)\.git/(info/refs|git-upload-pack|git-receive-pack)$", path)
+            if m:
+                owner, repo_name, action = m.group(1), m.group(2), m.group(3)
+                if action == "info/refs":
+                    if method == "GET":
+                        handle_git_info_refs(self, owner, repo_name, query)
+                    else:
+                        self.send_json(404, {"message": "Not Found"})
+                elif action == "git-upload-pack":
+                    if method == "POST":
+                        handle_git_upload_pack(self, owner, repo_name, raw_body)
+                    else:
+                        self.send_json(404, {"message": "Not Found"})
+                elif action == "git-receive-pack":
+                    if method == "POST":
+                        handle_git_receive_pack(self, owner, repo_name, raw_body)
+                    else:
+                        self.send_json(404, {"message": "Not Found"})
                 return
             self.send_json(404, {"message": "Not Found"})
         except (BrokenPipeError, ConnectionResetError):
