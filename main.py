@@ -49,16 +49,34 @@ REPO_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 
 # The Date header only changes once a second, but date_time_string()
 # rebuilds it from scratch (email.utils.formatdate) on every response.
-# Cache it per second; a race between threads just rewrites the same value.
-_DATE_CACHE = {"second": -1, "value": ""}
+# Cache it per second as bytes (the header is built in bytes); a race
+# between threads just rewrites the same value.
+_DATE_CACHE = {"second": -1, "value": b""}
 
 
 def _date_header():
     now = int(time.time())
     if now != _DATE_CACHE["second"]:
         _DATE_CACHE["second"] = now
-        _DATE_CACHE["value"] = email.utils.formatdate(now, usegmt=True)
+        _DATE_CACHE["value"] = email.utils.formatdate(now, usegmt=True).encode("ascii")
     return _DATE_CACHE["value"]
+
+# The bearer token the suite presents never changes for a process (it is
+# in the environment before main.py starts), so read it once instead of
+# calling os.environ.get on every authenticated request.
+_SHOP_TOKEN = os.environ.get("MAKEFUN_SHOP_TOKEN")
+
+# Prebuilt status lines for every status _send ever answers with (the
+# reason strings are BaseHTTPRequestHandler's own), and the fixed tail of
+# the response head: one bytes-% format replaces six str formats, a join
+# and a whole-head encode per response.
+_STATUS_LINES = {}
+for _code in (200, 201, 204, 400, 401, 404, 405, 409, 422, 500):
+    _reason = BaseHTTPRequestHandler.responses.get(_code, ("?",))[0]
+    _STATUS_LINES[_code] = (
+        "HTTP/1.1 %d %s\r\n" % (_code, _reason)).encode("ascii")
+_HEAD_TAIL = (b"Server: Forge/1.0\r\nDate: %s\r\nContent-Type: %s\r\n"
+              b"Content-Length: %d\r\nX-GitHub-Request-Id: req-%d\r\n")
 
 # ---------------------------------------------------------------------------
 # Scenario PRNG (replicates program/env/src/wire.ts)
@@ -541,7 +559,7 @@ def decode_pkt_lines(buf):
 
 class Issue:
     __slots__ = ("number", "id", "title", "body", "state", "labels",
-                 "seq", "comments")
+                 "seq", "comments", "_body")
 
     def __init__(self, number, gid, title, body, labels, seq):
         self.number = number
@@ -552,6 +570,11 @@ class Issue:
         self.labels = list(labels)
         self.seq = seq
         self.comments = []  # list of {"id": int, "body": str}
+        # Cached serialized issue_json bytes for the read hot path (the
+        # bench reads one issue 2,000 times). Cleared on any mutation
+        # (PATCH in _rest_issues, closeIssue in GraphQL); labels never
+        # change after creation and comments are not in the shape.
+        self._body = None
 
 
 class PullRequest:
@@ -580,7 +603,8 @@ class PullRequest:
 class Repo:
     __slots__ = ("owner", "name", "description", "private", "default_branch",
                  "id", "seq", "objects", "refs", "issues", "prs", "labels",
-                 "version", "pack_cache", "fetch_cache")
+                 "version", "pack_cache", "fetch_cache", "next_issue",
+                 "upload_cache")
 
     def __init__(self, owner, name, description, private, gid, seq):
         self.owner = owner
@@ -598,6 +622,14 @@ class Repo:
         self.version = 0    # bumped on any mutation (invalidates pack cache)
         self.pack_cache = {}  # frozenset(oids) -> pack bytes
         self.fetch_cache = {}  # (wants, haves, shallows, depth, proto) -> response bytes
+        # Next issue number: max(repo.issues.keys()) is O(n) per create
+        # and the write bench creates 200 in a row; a counter is exact
+        # because issue numbers are never reused or removed.
+        self.next_issue = 1
+        # Raw upload-pack v2 request body -> full response bytes. The 50
+        # concurrent clones send identical fetch bodies; a repeat is a
+        # dict lookup + send instead of pkt-line parsing + fetch collect.
+        self.upload_cache = {}
 
     def full_name(self):
         return "%s/%s" % (self.owner, self.name)
@@ -609,6 +641,7 @@ class Repo:
         self.version += 1
         self.pack_cache = {}
         self.fetch_cache = {}
+        self.upload_cache = {}
 
 
 class Store:
@@ -715,6 +748,19 @@ def issue_json(repo, issue):
         "labels": [{"name": n} for n in issue.labels],
         "user": {"login": repo.owner},
     }
+
+
+def _issue_body(repo, issue):
+    """Serialized issue_json bytes, cached on the issue (see Issue._body).
+    Byte-identical to json.dumps(issue_json(...), separators=(",", ":"))
+    every time: the dict is built in a fixed key order, so the cached
+    bytes are exactly what send_json would have produced."""
+    cached = issue._body
+    if cached is None:
+        cached = json.dumps(issue_json(repo, issue),
+                            separators=(",", ":")).encode("utf-8")
+        issue._body = cached
+    return cached
 
 
 def pr_json(repo, pr):
@@ -905,6 +951,20 @@ def _ref_lines_v0(repo, caps):
     return lines
 
 
+# The protocol-v2 upload-pack advertisement never varies (no ref data
+# in it), so build it once instead of 8 pkt() calls per info/refs.
+_V2_UPLOAD_ADVERTISEMENT = b"".join([
+    pkt("# service=git-upload-pack\n"),
+    pkt_flush(),
+    pkt("version 2\n"),
+    pkt("agent=forge/1.0\n"),
+    pkt("ls-refs=unborn\n"),
+    pkt("fetch=shallow\n"),
+    pkt("object-format=sha1\n"),
+    pkt_flush(),
+])
+
+
 def handle_git_info_refs(handler, owner, repo_name, query):
     repo = STORE.get_repo(owner, repo_name)
     service = query.get("service", [None])[0]
@@ -913,17 +973,7 @@ def handle_git_info_refs(handler, owner, repo_name, query):
         return
     proto = handler.headers.get("Git-Protocol", "")
     if service == "git-upload-pack" and proto == "version=2":
-        body = b"".join([
-            pkt("# service=git-upload-pack\n"),
-            pkt_flush(),
-            pkt("version 2\n"),
-            pkt("agent=forge/1.0\n"),
-            pkt("ls-refs=unborn\n"),
-            pkt("fetch=shallow\n"),
-            pkt("object-format=sha1\n"),
-            pkt_flush(),
-        ])
-        handler.send_bytes(200, body,
+        handler.send_bytes(200, _V2_UPLOAD_ADVERTISEMENT,
                            "application/x-git-upload-pack-advertisement")
         return
     if service == "git-upload-pack":
@@ -997,6 +1047,15 @@ def handle_git_upload_pack(handler, owner, repo_name, body):
 
 
 def _handle_upload_pack_v2(handler, repo, body):
+    # Raw-body cache: the 50 concurrent clones send byte-identical fetch
+    # bodies, and the response is fully determined by (repo state, body)
+    # — the body encodes the command and every argument, and repo.bump()
+    # clears this cache on any mutation. A hit skips pkt-line parsing,
+    # argument extraction and the fetch collect entirely.
+    cached = repo.upload_cache.get(body)
+    if cached is not None:
+        handler.send_bytes(200, cached, "application/x-git-upload-pack-result")
+        return
     lines, _consumed, ok = decode_pkt_lines(body)
     if not ok:
         handler.send_bytes(400, b"bad pkt-line stream", "text/plain")
@@ -1041,12 +1100,22 @@ def _handle_upload_pack_v2(handler, repo, body):
     if command == "ls-refs":
         out = b"".join(pkt(l) for l in _ls_refs_response(repo, args))
         out += pkt_flush()
+        _cache_upload(repo, body, out)
         handler.send_bytes(200, out, "application/x-git-upload-pack-result")
         return
     if command != "fetch":
         handler.send_bytes(400, b"unknown command", "text/plain")
         return
-    _serve_fetch(handler, repo, args)
+    out = _serve_fetch(repo, args)
+    _cache_upload(repo, body, out)
+    handler.send_bytes(200, out, "application/x-git-upload-pack-result")
+
+
+def _cache_upload(repo, body, out):
+    """Store a raw-body -> response entry, bounded like fetch_cache."""
+    if len(repo.upload_cache) > 512:
+        repo.upload_cache.clear()
+    repo.upload_cache[body] = out
 
 
 def _handle_upload_pack_v0(handler, repo, body):
@@ -1097,7 +1166,9 @@ def _collect_fetch(repo, wants, haves, shallows, depth):
     return send, shallow, unshallow
 
 
-def _serve_fetch(handler, repo, args):
+def _serve_fetch(repo, args):
+    """Build the v2 fetch response bytes (the caller sends them, and the
+    raw-body cache in _handle_upload_pack_v2 stores them)."""
     wants = args["wants"]
     haves = args["haves"]
     shallows = args["shallows"]
@@ -1109,8 +1180,7 @@ def _serve_fetch(handler, repo, args):
     key = (tuple(wants), tuple(haves), tuple(shallows), depth, 2)
     cached = repo.fetch_cache.get(key)
     if cached is not None:
-        handler.send_bytes(200, cached, "application/x-git-upload-pack-result")
-        return
+        return cached
     send, shallow, unshallow = _collect_fetch(repo, wants, haves, shallows, depth)
     pack = STORE.get_pack(send)
     out = bytearray()
@@ -1131,7 +1201,7 @@ def _serve_fetch(handler, repo, args):
     if len(repo.fetch_cache) > 512:
         repo.fetch_cache.clear()
     repo.fetch_cache[key] = out
-    handler.send_bytes(200, out, "application/x-git-upload-pack-result")
+    return out
 
 
 def _serve_fetch_v0(handler, repo, args):
@@ -1664,7 +1734,8 @@ def _rest_issues(handler, method, repo, rest, query):
                     if lname not in repo.labels:
                         handler.send_json(422, {"message": "Label does not exist"})
                         return True
-                number = max(repo.issues.keys(), default=0) + 1
+                number = repo.next_issue
+                repo.next_issue += 1
                 issue = Issue(number, STORE.new_id(), title,
                               body.get("body") or "", labels, STORE.new_seq())
                 repo.issues[number] = issue
@@ -1698,7 +1769,9 @@ def _rest_issues(handler, method, repo, rest, query):
         return True
     if len(rest) == 1:
         if method == "GET":
-            handler.send_json(200, issue_json(repo, issue))
+            # Read hot path: serve the cached serialized body.
+            handler.send_bytes(200, _issue_body(repo, issue),
+                               "application/json")
             return True
         if method == "PATCH":
             body, err = _read_json_body(handler)
@@ -1712,6 +1785,8 @@ def _rest_issues(handler, method, repo, rest, query):
                     issue.title = body["title"]
                 if "body" in body:
                     issue.body = body["body"]
+                # Any mutation invalidates the cached serialized body.
+                issue._body = None
             handler.send_json(200, issue_json(repo, issue))
             return True
         handler.send_json(404, {"message": "Not Found"})
@@ -2077,7 +2152,8 @@ def _gql_dispatch_operation(op_name, variables):
         if repo is None:
             return None, [{"message": "Could not resolve to a Repository."}]
         with STORE.lock:
-            number = max(repo.issues.keys(), default=0) + 1
+            number = repo.next_issue
+            repo.next_issue += 1
             issue = Issue(number, STORE.new_id(), inp.get("title") or "",
                           inp.get("body") or "", [], STORE.new_seq())
             repo.issues[number] = issue
@@ -2093,6 +2169,7 @@ def _gql_dispatch_operation(op_name, variables):
             return None, [{"message": "Could not resolve to an Issue."}]
         with STORE.lock:
             issue.state = "closed"
+            issue._body = None
         return {"closeIssue": {"issue": _gql_issue_fields(repo, issue)}}, None
     if op_name == "PullRequestCreate":
         inp = variables.get("input") or {}
@@ -2390,7 +2467,8 @@ def _mcp_call_tool(name, args):
         if repo is None:
             return _mcp_error_result("Repository not found")
         with STORE.lock:
-            number = max(repo.issues.keys(), default=0) + 1
+            number = repo.next_issue
+            repo.next_issue += 1
             issue = Issue(number, STORE.new_id(), title,
                           args.get("body") or "", [], STORE.new_seq())
             repo.issues[number] = issue
@@ -2557,31 +2635,42 @@ class ForgeHandler(BaseHTTPRequestHandler):
             return False
         if len(words) >= 3:  # Enough to determine protocol version
             version = words[-1]
-            try:
-                if not version.startswith("HTTP/"):
-                    raise ValueError
-                base_version_number = version.split("/", 1)[1]
-                version_number = base_version_number.split(".")
-                if len(version_number) != 2:
-                    raise ValueError
-                if any(not component.isdigit() for component in version_number):
-                    raise ValueError("non digit in http version")
-                if any(len(component) > 10 for component in version_number):
-                    raise ValueError("unreasonable length http version")
-                version_number = int(version_number[0]), int(version_number[1])
-            except (ValueError, IndexError):
-                self.send_error(
-                    HTTPStatus.BAD_REQUEST,
-                    "Bad request version (%r)" % version)
-                return False
-            if version_number >= (1, 1) and self.protocol_version >= "HTTP/1.1":
-                self.close_connection = False
-            if version_number >= (2, 0):
-                self.send_error(
-                    HTTPStatus.HTTP_VERSION_NOT_SUPPORTED,
-                    "Invalid HTTP version (%s)" % base_version_number)
-                return False
-            self.request_version = version
+            if version == "HTTP/1.1":
+                # Fast path: every client the suite drives speaks HTTP/1.1.
+                # (1,1) >= (1,1) and protocol_version is HTTP/1.1, so the
+                # connection stays open, exactly as the general parse below.
+                if self.protocol_version >= "HTTP/1.1":
+                    self.close_connection = False
+                self.request_version = version
+            elif version == "HTTP/1.0":
+                # (1,0) < (1,1): the connection closes, as below.
+                self.request_version = version
+            else:
+                try:
+                    if not version.startswith("HTTP/"):
+                        raise ValueError
+                    base_version_number = version.split("/", 1)[1]
+                    version_number = base_version_number.split(".")
+                    if len(version_number) != 2:
+                        raise ValueError
+                    if any(not component.isdigit() for component in version_number):
+                        raise ValueError("non digit in http version")
+                    if any(len(component) > 10 for component in version_number):
+                        raise ValueError("unreasonable length http version")
+                    version_number = int(version_number[0]), int(version_number[1])
+                except (ValueError, IndexError):
+                    self.send_error(
+                        HTTPStatus.BAD_REQUEST,
+                        "Bad request version (%r)" % version)
+                    return False
+                if version_number >= (1, 1) and self.protocol_version >= "HTTP/1.1":
+                    self.close_connection = False
+                if version_number >= (2, 0):
+                    self.send_error(
+                        HTTPStatus.HTTP_VERSION_NOT_SUPPORTED,
+                        "Invalid HTTP version (%s)" % base_version_number)
+                    return False
+                self.request_version = version
         if not 2 <= len(words) <= 3:
             self.send_error(
                 HTTPStatus.BAD_REQUEST,
@@ -2646,15 +2735,16 @@ class ForgeHandler(BaseHTTPRequestHandler):
 
     # -- auth ---------------------------------------------------------------
     def authorized(self):
-        token = os.environ.get("MAKEFUN_SHOP_TOKEN")
         auth = self.headers.get("Authorization") or ""
         if not auth.startswith("Bearer "):
             return False
         presented = auth[len("Bearer "):].strip()
         if not presented:
             return False
-        if token:
-            return presented == token
+        # _SHOP_TOKEN is read once at import (the token never changes for
+        # a process); the local no-token case still accepts any bearer.
+        if _SHOP_TOKEN:
+            return presented == _SHOP_TOKEN
         return True
 
     # -- send helpers -------------------------------------------------------
@@ -2662,21 +2752,24 @@ class ForgeHandler(BaseHTTPRequestHandler):
         # One buffered write for the whole response (status line, headers
         # and body): BaseHTTPRequestHandler's send_response/send_header
         # chain issues ~8 small writes per response, each a syscall.
+        # The head is built from a precomputed status line plus one
+        # bytes-% format over the cached Date, content type, length and
+        # the request sequence (inlined here; request_id() is now unused).
         if isinstance(body, str):
             body = body.encode("utf-8")
-        reason = self.responses.get(status, ("?",))[0]
-        lines = [
-            "HTTP/1.1 %d %s" % (status, reason),
-            "Server: Forge/1.0",
-            "Date: %s" % _date_header(),
-            "Content-Type: %s" % ctype,
-            "Content-Length: %d" % len(body),
-            "X-GitHub-Request-Id: %s" % STORE.request_id(),
-        ]
+        if isinstance(ctype, str):
+            ctype = ctype.encode("ascii", "replace")
+        STORE.request_seq += 1
+        line = _STATUS_LINES.get(status)
+        if line is None:
+            reason = self.responses.get(status, ("?",))[0]
+            line = ("HTTP/1.1 %d %s\r\n" % (status, reason)).encode("ascii")
+        head = line + _HEAD_TAIL % (_date_header(), ctype, len(body),
+                                    STORE.request_seq)
         if extra_headers:
             for k, v in extra_headers.items():
-                lines.append("%s: %s" % (k, v))
-        head = ("\r\n".join(lines) + "\r\n\r\n").encode("ascii", "replace")
+                head += ("%s: %s\r\n" % (k, v)).encode("ascii", "replace")
+        head += b"\r\n"
         try:
             if self.command != "HEAD" and body:
                 self.wfile.write(head + body)
@@ -2700,9 +2793,17 @@ class ForgeHandler(BaseHTTPRequestHandler):
 
     # -- routing ------------------------------------------------------------
     def _route(self, method):
-        parsed = urllib.parse.urlsplit(self.path)
-        path = parsed.path
-        query = urllib.parse.parse_qs(parsed.query) if parsed.query else {}
+        # Split path/query without urlsplit: the suite always sends
+        # origin-form paths with no fragment, so a partition is exact;
+        # absolute-form or a fragment falls back to urlsplit (same result).
+        raw_path = self.path
+        if raw_path.startswith(("http://", "https://")) or "#" in raw_path:
+            parsed = urllib.parse.urlsplit(raw_path)
+            path = parsed.path
+            query = urllib.parse.parse_qs(parsed.query) if parsed.query else {}
+        else:
+            path, _sep, qs = raw_path.partition("?")
+            query = urllib.parse.parse_qs(qs) if _sep else {}
         # Consume any request body up front. A handler that answers early
         # (401/404) without reading it would leave bytes in the socket and
         # desync the keep-alive connection, corrupting the next request.
@@ -2719,7 +2820,11 @@ class ForgeHandler(BaseHTTPRequestHandler):
             # paths never start with /api/ or /mcp, so the order is safe.
             if path == "/api/v3" or path.startswith("/api/v3/"):
                 rest_path = path[len("/api/v3"):].strip("/")
-                parts = [urllib.parse.unquote(p) for p in rest_path.split("/") if p != ""] if rest_path else []
+                # unquote only segments that carry a % escape (a segment
+                # without one is unchanged by unquote, so this is exact
+                # and skips ~5 unquote calls on the hot REST paths).
+                parts = [(urllib.parse.unquote(p) if "%" in p else p)
+                         for p in rest_path.split("/") if p != ""] if rest_path else []
                 rest_dispatch(self, method, parts, query)
                 return
             # GraphQL
